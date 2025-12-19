@@ -131,12 +131,27 @@ module.exports = async (req, res) => {
     const path = req.url.split('?')[0];
     
     if (path.includes('/subtitles')) {
-      // Search endpoint
-      const queryParams = new URLSearchParams(req.query).toString();
-      const url = `${OPENTITLES_BASE_URL}/subtitles?${queryParams}`;
-      
-      console.log('Proxying request to:', url);
-      
+      const {
+        query,
+        year,
+        languages = 'en'
+      } = req.query;
+    
+      if (!query) {
+        return res.status(400).json({ error: 'query is required' });
+      }
+    
+      const params = new URLSearchParams({
+        query,
+        type: 'movie',
+        languages,
+        order_by: 'moviehash_match',
+        order_direction: 'desc',
+        ...(year ? { year } : {})
+      });
+    
+      const url = `${OPENTITLES_BASE_URL}/subtitles?${params.toString()}`;
+    
       const response = await makeRequest(url, {
         method: 'GET',
         headers: {
@@ -145,91 +160,64 @@ module.exports = async (req, res) => {
           'User-Agent': 'SubtitleSearchApp v1.0.0'
         }
       });
-
+    
       if (!response.ok) {
-        const errorText = await response.text();
-        return res.status(response.status).json({ 
-          error: `API returned ${response.status}: ${response.statusText}`,
-          details: errorText.substring(0, 200)
+        return res.status(response.status).json({
+          error: 'Subtitle search failed'
         });
       }
-
-      const responseText = await response.text();
-      
-      // Check if response is HTML (error page) instead of JSON
-      if (responseText.trim().startsWith('<!DOCTYPE') || 
-          responseText.trim().startsWith('<html') || 
-          responseText.trim().startsWith('<meta') ||
-          responseText.includes('<html>')) {
-        const titleMatch = responseText.match(/<title>(.*?)<\/title>/i);
-        const errorTitle = titleMatch ? titleMatch[1] : 'Unknown error';
-        
-        return res.status(500).json({ 
-          error: `API returned HTML error page: ${errorTitle}`,
-          details: 'This usually means the language code is not supported or the request parameters are invalid.',
-          suggestion: 'Try searching without a language filter, or use a different language code.'
-        });
-      }
-
-      let data;
-      try {
-        data = JSON.parse(responseText);
-      } catch (parseError) {
-        return res.status(500).json({ 
-          error: 'Invalid JSON response from API',
-          details: parseError.message,
-          responsePreview: responseText.substring(0, 300)
-        });
-      }
-
-      return res.json(data);
-      
-    } else if (path.includes('/download')) {
-      // Download endpoint
-      const url = `${OPENTITLES_BASE_URL}/download`;
-      
-      const response = await makeRequest(url, {
-        method: 'POST',
-        headers: {
-          'Api-Key': OPENTITLES_API_KEY,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'User-Agent': 'SubtitleSearchApp v1.0.0'
-        },
-        body: JSON.stringify(req.body)
+    
+      const data = await response.json();
+    
+      // 🔐 FILTER WRONG MOVIES
+      const safeResults = data.data.filter(sub => {
+        const attr = sub.attributes;
+        const titleMatch =
+          attr.movie_name?.toLowerCase().includes(query.toLowerCase());
+    
+        const yearMatch =
+          !year || Math.abs(attr.year - year) <= 1;
+    
+        return titleMatch && yearMatch;
       });
-
+    
+      return res.json({
+        total: safeResults.length,
+        data: safeResults
+      });
+    }
+    
+     else if (path.includes('/download')) {
+      const { file_id } = req.body;
+    
+      if (!file_id) {
+        return res.status(400).json({ error: 'file_id is required' });
+      }
+    
+      const response = await makeRequest(
+        `${OPENTITLES_BASE_URL}/download`,
+        {
+          method: 'POST',
+          headers: {
+            'Api-Key': OPENTITLES_API_KEY,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'SubtitleSearchApp v1.0.0'
+          },
+          body: JSON.stringify({ file_id })
+        }
+      );
+    
       if (!response.ok) {
-        const errorText = await response.text();
-        return res.status(response.status).json({ 
-          error: `API returned ${response.status}: ${response.statusText}`,
-          details: errorText.substring(0, 200)
+        return res.status(response.status).json({
+          error: 'Subtitle download failed'
         });
       }
-
-      const responseText = await response.text();
-      
-      // Check if response is HTML
-      if (responseText.trim().startsWith('<!DOCTYPE') || 
-          responseText.trim().startsWith('<html') || 
-          responseText.trim().startsWith('<meta')) {
-        return res.status(500).json({ 
-          error: 'API returned HTML error page instead of JSON'
-        });
-      }
-
-      let data;
-      try {
-        data = JSON.parse(responseText);
-      } catch (parseError) {
-        return res.status(500).json({ 
-          error: 'Invalid JSON response from API',
-          details: parseError.message
-        });
-      }
-
+    
+      const data = await response.json();
       return res.json(data);
-    } else {
+    }
+     else {
       return res.status(404).json({ error: 'Endpoint not found' });
     }
   } catch (error) {
