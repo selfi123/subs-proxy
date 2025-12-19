@@ -183,51 +183,69 @@ module.exports = async (req, res) => {
       return res.json(data);
       
     } else if (path.includes('/download')) {
-      // Download endpoint
-      const url = `${OPENTITLES_BASE_URL}/download`;
-      
-      const response = await makeRequest(url, {
-        method: 'POST',
-        headers: {
-          'Api-Key': OPENTITLES_API_KEY,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'User-Agent': 'SubtitleSearchApp v1.0.0'
-        },
-        body: JSON.stringify(req.body)
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        return res.status(response.status).json({ 
-          error: `API returned ${response.status}: ${response.statusText}`,
-          details: errorText.substring(0, 200)
+      const { file_id, expected_title } = req.body;
+    
+      if (!file_id || !expected_title) {
+        return res.status(400).json({
+          error: 'file_id and expected_title are required'
         });
       }
-
-      const responseText = await response.text();
-      
-      // Check if response is HTML
-      if (responseText.trim().startsWith('<!DOCTYPE') || 
-          responseText.trim().startsWith('<html') || 
-          responseText.trim().startsWith('<meta')) {
-        return res.status(500).json({ 
-          error: 'API returned HTML error page instead of JSON'
+    
+      // Step 1: Get download link
+      const metaResponse = await makeRequest(
+        `${OPENTITLES_BASE_URL}/download`,
+        {
+          method: 'POST',
+          headers: {
+            'Api-Key': OPENTITLES_API_KEY,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'SubtitleSearchApp v1.0.0'
+          },
+          body: JSON.stringify({ file_id })
+        }
+      );
+    
+      if (!metaResponse.ok) {
+        return res.status(500).json({ error: 'Failed to get download URL' });
+      }
+    
+      const meta = await metaResponse.json();
+      const subtitleUrl = meta.link;
+    
+      // Step 2: Download subtitle file
+      const subtitleResponse = await makeRequest(subtitleUrl);
+    
+      const subtitleText = await subtitleResponse.text();
+    
+      // Step 3: Validate subtitle content
+      const normalizedExpected = expected_title
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '');
+    
+      const subtitleSample = subtitleText
+        .split('\n')
+        .slice(0, 50)
+        .join(' ')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '');
+    
+      if (!subtitleSample.includes(normalizedExpected)) {
+        return res.status(409).json({
+          error: 'Subtitle content does not match selected movie'
         });
       }
-
-      let data;
-      try {
-        data = JSON.parse(responseText);
-      } catch (parseError) {
-        return res.status(500).json({ 
-          error: 'Invalid JSON response from API',
-          details: parseError.message
-        });
-      }
-
-      return res.json(data);
-    } else {
+    
+      // Step 4: Send subtitle file
+      res.setHeader('Content-Type', 'application/x-subrip');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${expected_title}.srt"`
+      );
+    
+      return res.send(subtitleText);
+    }
+    else {
       return res.status(404).json({ error: 'Endpoint not found' });
     }
   } catch (error) {
