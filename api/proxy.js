@@ -1,14 +1,22 @@
+// ===============================
+// OpenSubtitles + TMDB Proxy
+// ===============================
 
 const https = require('https');
 const http = require('http');
 
-const OPENTITLES_API_KEY = 'qo2wQs1PXwIHJsXvIiWXu1ZbVjaboPh6';
-const OPENTITLES_BASE_URL = 'https://api.opensubtitles.com/api/v1';
+// ===== CONFIG =====
+const OPENSUBTITLES_API_KEY = 'qo2wQs1PXwIHJsXvIiWXu1ZbVjaboPh6';
+const OPENSUBTITLES_BASE_URL = 'https://api.opensubtitles.com/api/v1';
 
-// Helper function to make HTTP requests with redirect handling
+const TMDB_API_KEY = '5dbb076a21a64be1dd6e0693a68091ab';
+const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+
+// ===============================
+// Generic HTTP request helper
+// ===============================
 function makeRequest(url, options = {}, redirectCount = 0) {
   return new Promise((resolve, reject) => {
-    // Prevent infinite redirect loops
     if (redirectCount > 5) {
       reject(new Error('Too many redirects'));
       return;
@@ -16,188 +24,161 @@ function makeRequest(url, options = {}, redirectCount = 0) {
 
     const urlObj = new URL(url);
     const protocol = urlObj.protocol === 'https:' ? https : http;
-    
-    const requestOptions = {
-      hostname: urlObj.hostname,
-      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-      path: urlObj.pathname + urlObj.search,
-      method: options.method || 'GET',
-      headers: options.headers || {}
-    };
 
-    const req = protocol.request(requestOptions, (res) => {
-      // Handle redirects (301, 302, 307, 308)
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        const redirectUrl = res.headers.location;
-        console.log(`Following redirect ${res.statusCode} to: ${redirectUrl}`);
-        
-        // If redirect goes to HTML page (error), don't follow it
-        if (redirectUrl.includes('.html') || redirectUrl.includes('/error')) {
-          let errorData = '';
-          res.on('data', (chunk) => { errorData += chunk; });
-          res.on('end', () => {
-            reject(new Error(`Redirect to error page: ${redirectUrl}. Response: ${errorData.substring(0, 200)}`));
-          });
-          return;
+    const req = protocol.request(
+      {
+        hostname: urlObj.hostname,
+        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+        path: urlObj.pathname + urlObj.search,
+        method: options.method || 'GET',
+        headers: options.headers || {}
+      },
+      (res) => {
+        if (
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location
+        ) {
+          const nextUrl = res.headers.location.startsWith('http')
+            ? res.headers.location
+            : `${urlObj.protocol}//${urlObj.hostname}${res.headers.location}`;
+
+          return makeRequest(nextUrl, options, redirectCount + 1)
+            .then(resolve)
+            .catch(reject);
         }
-        
-        // Resolve relative URLs
-        const newUrl = redirectUrl.startsWith('http') 
-          ? redirectUrl 
-          : `${urlObj.protocol}//${urlObj.hostname}${redirectUrl}`;
-        
-        // Preserve headers for redirect
-        const redirectOptions = {
-          ...options,
-          headers: {
-            ...options.headers
-          }
-        };
-        
-        // Recursively follow redirect
-        return makeRequest(newUrl, redirectOptions, redirectCount + 1)
-          .then(resolve)
-          .catch(reject);
-      }
 
-      let data = '';
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      res.on('end', () => {
-        // Check if response is HTML (error page)
-        const isHtml = data.trim().startsWith('<!DOCTYPE') || 
-                       data.trim().startsWith('<html') || 
-                       data.trim().startsWith('<meta') ||
-                       data.includes('<html') ||
-                       res.headers['content-type']?.includes('text/html');
-        
-        if (isHtml && res.statusCode >= 200 && res.statusCode < 300) {
-          // API returned HTML instead of JSON - treat as error
-          resolve({
-            ok: false,
-            status: 500,
-            statusText: 'HTML Response',
-            json: async () => {
-              throw new Error(`API returned HTML instead of JSON: ${data.substring(0, 200)}`);
-            },
-            text: async () => data
-          });
-        } else {
+        let data = '';
+        res.on('data', (c) => (data += c));
+        res.on('end', () => {
           resolve({
             ok: res.statusCode >= 200 && res.statusCode < 300,
             status: res.statusCode,
-            statusText: res.statusMessage,
-            json: async () => {
-              try {
-                return JSON.parse(data);
-              } catch (e) {
-                throw new Error(`Invalid JSON response: ${data.substring(0, 200)}`);
-              }
-            },
-            text: async () => data
+            text: async () => data,
+            json: async () => JSON.parse(data)
           });
-        }
-      });
-    });
+        });
+      }
+    );
 
-    req.on('error', (error) => {
-      reject(error);
-    });
+    req.on('error', reject);
 
-    if (options.body) {
-      req.write(options.body);
-    }
-
+    if (options.body) req.write(options.body);
     req.end();
   });
 }
 
-// Vercel serverless function handler
+// ===============================
+// TMDB → IMDb resolver
+// ===============================
+async function resolveImdbId(title, year = null) {
+  const params = new URLSearchParams({
+    api_key: TMDB_API_KEY,
+    query: title
+  });
+
+  if (year) params.append('year', year);
+
+  const searchRes = await makeRequest(
+    `${TMDB_BASE_URL}/search/movie?${params.toString()}`
+  );
+  if (!searchRes.ok) return null;
+
+  const searchData = await searchRes.json();
+  const movie = searchData.results?.[0];
+  if (!movie) return null;
+
+  const extRes = await makeRequest(
+    `${TMDB_BASE_URL}/movie/${movie.id}/external_ids?api_key=${TMDB_API_KEY}`
+  );
+  if (!extRes.ok) return null;
+
+  const extData = await extRes.json();
+  return extData.imdb_id || null;
+}
+
+// ===============================
+// Vercel handler
+// ===============================
 module.exports = async (req, res) => {
-  // Enable CORS
+  // ---- CORS ----
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
     const path = req.url.split('?')[0];
-    
+
+    // ===============================
+    // SEARCH SUBTITLES
+    // ===============================
     if (path.includes('/subtitles')) {
-      // Search endpoint
-      const queryParams = new URLSearchParams(req.query).toString();
-      const url = `${OPENTITLES_BASE_URL}/subtitles?${queryParams}`;
-      
-      console.log('Proxying request to:', url);
-      
-      const response = await makeRequest(url, {
-        method: 'GET',
+      const { query, year, languages = 'en' } = req.query;
+
+      if (!query) {
+        return res.status(400).json({ error: 'query is required' });
+      }
+
+      // 🔑 Resolve IMDb automatically
+      const imdbId = await resolveImdbId(query, year);
+
+      const params = new URLSearchParams({
+        languages,
+        type: 'movie',
+        order_by: 'downloads',
+        order_direction: 'desc'
+      });
+
+      if (imdbId) {
+        // OpenSubtitles wants IMDb WITHOUT "tt"
+        params.append('imdb_id', imdbId.replace('tt', ''));
+      } else {
+        // fallback (rare)
+        params.append('query', query);
+      }
+
+      const osUrl = `${OPENSUBTITLES_BASE_URL}/subtitles?${params.toString()}`;
+
+      const response = await makeRequest(osUrl, {
         headers: {
-          'Api-Key': OPENTITLES_API_KEY,
+          'Api-Key': OPENSUBTITLES_API_KEY,
           'Accept': 'application/json',
           'User-Agent': 'SubtitleSearchApp v1.0.0'
         }
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        return res.status(response.status).json({ 
-          error: `API returned ${response.status}: ${response.statusText}`,
-          details: errorText.substring(0, 200)
+        return res.status(response.status).json({
+          error: 'OpenSubtitles search failed'
         });
       }
 
-      const responseText = await response.text();
-      
-      // Check if response is HTML (error page) instead of JSON
-      if (responseText.trim().startsWith('<!DOCTYPE') || 
-          responseText.trim().startsWith('<html') || 
-          responseText.trim().startsWith('<meta') ||
-          responseText.includes('<html>')) {
-        const titleMatch = responseText.match(/<title>(.*?)<\/title>/i);
-        const errorTitle = titleMatch ? titleMatch[1] : 'Unknown error';
-        
-        return res.status(500).json({ 
-          error: `API returned HTML error page: ${errorTitle}`,
-          details: 'This usually means the language code is not supported or the request parameters are invalid.',
-          suggestion: 'Try searching without a language filter, or use a different language code.'
-        });
+      const data = await response.json();
+      return res.json({
+        imdb_id: imdbId,
+        total: data.data.length,
+        data: data.data
+      });
+    }
+
+    // ===============================
+    // DOWNLOAD SUBTITLE
+    // ===============================
+    if (path.includes('/download')) {
+      const { file_id } = req.body || {};
+
+      if (!file_id) {
+        return res.status(400).json({ error: 'file_id is required' });
       }
 
-      let data;
-      try {
-        data = JSON.parse(responseText);
-      } catch (parseError) {
-        return res.status(500).json({ 
-          error: 'Invalid JSON response from API',
-          details: parseError.message,
-          responsePreview: responseText.substring(0, 300)
-        });
-      }
-
-      return res.json(data);
-      
-    } else if (path.includes('/download')) {
-      const { file_id, expected_title } = req.body;
-    
-      if (!file_id || !expected_title) {
-        return res.status(400).json({
-          error: 'file_id and expected_title are required'
-        });
-      }
-    
-      // Step 1: Get download link
-      const metaResponse = await makeRequest(
-        `${OPENTITLES_BASE_URL}/download`,
+      const response = await makeRequest(
+        `${OPENSUBTITLES_BASE_URL}/download`,
         {
           method: 'POST',
           headers: {
-            'Api-Key': OPENTITLES_API_KEY,
+            'Api-Key': OPENSUBTITLES_API_KEY,
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'User-Agent': 'SubtitleSearchApp v1.0.0'
@@ -205,51 +186,23 @@ module.exports = async (req, res) => {
           body: JSON.stringify({ file_id })
         }
       );
-    
-      if (!metaResponse.ok) {
-        return res.status(500).json({ error: 'Failed to get download URL' });
-      }
-    
-      const meta = await metaResponse.json();
-      const subtitleUrl = meta.link;
-    
-      // Step 2: Download subtitle file
-      const subtitleResponse = await makeRequest(subtitleUrl);
-    
-      const subtitleText = await subtitleResponse.text();
-    
-      // Step 3: Validate subtitle content
-      const normalizedExpected = expected_title
-        .toLowerCase()
-        .replace(/[^a-z0-9]/g, '');
-    
-      const subtitleSample = subtitleText
-        .split('\n')
-        .slice(0, 50)
-        .join(' ')
-        .toLowerCase()
-        .replace(/[^a-z0-9]/g, '');
-    
-      if (!subtitleSample.includes(normalizedExpected)) {
-        return res.status(409).json({
-          error: 'Subtitle content does not match selected movie'
+
+      if (!response.ok) {
+        return res.status(response.status).json({
+          error: 'OpenSubtitles download failed'
         });
       }
-    
-      // Step 4: Send subtitle file
-      res.setHeader('Content-Type', 'application/x-subrip');
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${expected_title}.srt"`
-      );
-    
-      return res.send(subtitleText);
+
+      const data = await response.json();
+      return res.json(data);
     }
-    else {
-      return res.status(404).json({ error: 'Endpoint not found' });
-    }
-  } catch (error) {
-    console.error('Proxy error:', error);
-    return res.status(500).json({ error: error.message });
+
+    // ===============================
+    // NOT FOUND
+    // ===============================
+    return res.status(404).json({ error: 'Endpoint not found' });
+  } catch (err) {
+    console.error('Proxy error:', err);
+    return res.status(500).json({ error: err.message });
   }
 };
